@@ -1,0 +1,357 @@
+- name: ONTAP Firmware Upgrade
+  hosts: localhost
+  gather_facts: no
+  ignore_errors: true
+  collections:
+  - netapp.ontap
+  vars_prompt:
+  - name: ontap_admin_username
+    private: no
+    prompt: Enter your ONTAP admin username
+  - name: ontap_admin_password
+    prompt: Enter the password for your ONTAP admin user
+  - name: ontap_firmware_url
+    private: no
+    prompt: "Enter the URL to the Firmware package(s) directory suffixed with a \"\
+      /\".\nExample: \"http://<web-server>/path/\""
+
+  vars:
+    ontap_use_https: true
+    ontap_validate_certs: false
+    login: &login
+      username: '{{ ontap_admin_username }}'
+      password: '{{ ontap_admin_password }}'
+      https: '{{ ontap_use_https }}'
+      validate_certs: '{{ ontap_validate_certs }}'
+  vars_files: inventory.yml
+
+  tasks:
+  - name: Run the ONTAP info module to check connectivity
+    na_ontap_info:
+      hostname: '{{ item.clustername }}'
+      <<: *login
+      gather_subset: ontap_system_version
+    register: login
+    with_items: '{{ clusters }}'
+    loop_control:
+      label: '{{ item.clustername }}'
+
+  - name: Populate login results
+    set_fact:
+      login_result: '{{ login_result|default({}) | combine( {item.1.clustername: not
+        item.0.failed} ) }}'
+    with_together:
+    - '{{ login.results }}'
+    - '{{ clusters }}'
+    loop_control:
+      label: '{{ item.1.clustername }}'
+
+  - name: Run the ONTAP command module to validate access permissions
+    na_ontap_command:
+      hostname: '{{ item.clustername }}'
+      <<: *login
+      command: version
+      return_dict: false
+    register: access
+    with_items:
+    - '{{ clusters }}'
+    loop_control:
+      label: '{{ item.clustername }}'
+    when: login_result[item.clustername]
+
+  - name: Sending Pre-run ASUP
+    na_ontap_command:
+      command: [autosupport invoke -node * -type all -message "Pre-Ansible Firmware
+          Update"]
+      hostname: '{{ item.clustername }}'
+      <<: *login
+    with_items:
+    - '{{ clusters }}'
+    loop_control:
+      label: '{{ item.clustername }}'
+    when: login_result[item.clustername]
+
+  - name: SP/BMC firmware download
+    tags:
+    - sp
+    na_ontap_firmware_upgrade:
+      state: present
+      hostname: '{{ item.0.clustername }}'
+      <<: *login
+      node: '{{ item.1.hostname }}'
+      package_url: '{{ ontap_firmware_url }}{{ item.1.sp_fw_file }}'
+      firmware_type: service-processor
+      replace_package: true
+      rename_package: SP_FW.zip
+      reboot_sp: true
+    register: sp_download
+    loop: "{{ query('subelements', clusters, 'sp_nodes', {'skip_missing': True})}}"
+    loop_control:
+      label: '{{ item.0.clustername }}:{{ item.1.hostname }}'
+    when: login_result[item.0.clustername]
+
+  - name: Populate SP/BMC download task results
+    tags:
+    - sp
+    set_fact:
+      sp_down_result: '{{ sp_down_result|default({}) | combine( {item.item.1.hostname:
+        item.changed} ) }}'
+    with_items:
+    - '{{ sp_download.results }}'
+    loop_control:
+      label: '{{ item.item.1.hostname }}'
+
+  - debug:
+      msg: The playbook will wait till the SP/BMC Firmware update completes and then
+        proceed with SP switch updates. Please do not stop the execution.
+    tags:
+    - sp
+
+  - name: Waiting for SP/BMC firmware updates to complete
+    tags:
+    - sp
+    pause:
+      minutes: 60
+
+  - name: SP/BMC firmware update finish version check
+    tags:
+    - sp
+    na_ontap_wait_for_condition:
+      hostname: '{{ item.0.clustername }}'
+      <<: *login
+      https: true
+      validate_certs: no
+      name: sp_version
+      conditions: firmware_version
+      state: present
+      attributes:
+        node: '{{ item.1.hostname }}'
+        expected_version: '{{ item.1.sp_fw_ver }}'
+      polling_interval: 30
+      timeout: 3600
+    register: sp_finish
+    loop: "{{ query('subelements', clusters, 'sp_nodes', {'skip_missing': True})}}"
+    loop_control:
+      label: '{{ item.0.clustername }}:{{ item.1.hostname }}'
+    when: sp_down_result[item.1.hostname]
+
+  - name: Populate SP update finish results
+    tags:
+    - sp
+    set_fact:
+      sp_finish_result: '{{ sp_finish_result|default({}) | combine( {item.item.1.hostname:
+        not item.failed|default(true)} ) }}'
+    with_items:
+    - '{{ sp_finish.results }}'
+    loop_control:
+      label: '{{ item.item.1.hostname }}'
+
+  - name: Waiting for 10 minutes for SP/BMC switch to become stable to update the
+      switch firmware
+    tags:
+    - sp
+    pause:
+      minutes: 10
+
+  - name: SP/BMC switch update commands - version command
+    tags:
+    - sp
+    na_ontap_ssh_command:
+      hostname: '{{ item.1.sp_ip }}'
+      <<: *login
+      command: '{{ item.1.sp_fw_type }} switch-version'
+      privilege: diag
+      sp: true
+      accept_unknown_host_keys: true
+    register: sp_switch_version
+    loop: "{{ query('subelements', clusters, 'sp_nodes', {'skip_missing': True})}}"
+    loop_control:
+      label: '{{ item.0.clustername }}:{{ item.1.hostname }}:{{ item.1.sp_ip }}'
+    when: sp_finish_result[item.1.hostname]
+
+  - name: Populate SP/BMC switch version command results
+    tags:
+    - sp
+    set_fact:
+      sp_version_result: '{{ sp_version_result|default({}) | combine( {item.item.1.hostname:
+        item.changed} ) }}'
+    with_items:
+    - '{{ sp_switch_version.results }}'
+    loop_control:
+      label: '{{ item.item.1.hostname }}'
+
+  - name: SP/BMC switch update commands - verify command
+    tags:
+    - sp
+    na_ontap_ssh_command:
+      hostname: '{{ item.1.sp_ip }}'
+      <<: *login
+      command: '{{ item.1.sp_fw_type }} switch-verify'
+      privilege: diag
+      sp: true
+      accept_unknown_host_keys: true
+    register: sp_switch_verify
+    loop: "{{ query('subelements', clusters, 'sp_nodes', {'skip_missing': True})}}"
+    loop_control:
+      label: '{{ item.0.clustername }}:{{ item.1.hostname }}:{{ item.1.sp_ip }}'
+    when: sp_finish_result[item.1.hostname] and sp_version_result[item.1.hostname]
+
+  - name: SP/BMC switch update commands - update command
+    tags:
+    - sp
+    na_ontap_ssh_command:
+      hostname: '{{ item.1.sp_ip }}'
+      <<: *login
+      command: '{{ item.1.sp_fw_type }} switch-update'
+      privilege: diag
+      sp: true
+      accept_unknown_host_keys: true
+    register: sp_switch_update
+    loop: "{{ query('subelements', clusters, 'sp_nodes', {'skip_missing': True})}}"
+    loop_control:
+      label: '{{ item.0.clustername }}:{{ item.1.hostname }}:{{ item.1.sp_ip }}'
+    when: sp_finish_result[item.1.hostname] and sp_version_result[item.1.hostname]
+
+  - name: SP/BMC switch update commands - verify command
+    tags:
+    - sp
+    na_ontap_ssh_command:
+      hostname: '{{ item.1.sp_ip }}'
+      <<: *login
+      command: '{{ item.1.sp_fw_type }} switch-verify'
+      privilege: diag
+      sp: true
+      accept_unknown_host_keys: true
+    register: sp_switch_verify
+    loop: "{{ query('subelements', clusters, 'sp_nodes', {'skip_missing': True})}}"
+    loop_control:
+      label: '{{ item.0.clustername }}:{{ item.1.hostname }}:{{ item.1.sp_ip }}'
+    when: sp_finish_result[item.1.hostname] and sp_version_result[item.1.hostname]
+
+  - name: Populate SP/BMC switch verify command results
+    tags:
+    - sp
+    set_fact:
+      sp_verify_result: '{{ sp_verify_result|default({}) | combine( {item.item.1.hostname:
+        item.changed} ) }}'
+    with_items:
+    - '{{ sp_switch_verify.results }}'
+    loop_control:
+      label: '{{ item.item.1.hostname }}'
+
+  - name: SP/BMC switch update commands- 'switch-reset' command
+    tags:
+    - sp
+    na_ontap_ssh_command:
+      hostname: '{{ item.1.sp_ip }}'
+      <<: *login
+      command: '{{ item.1.sp_fw_type }} switch-reset'
+      privilege: diag
+      sp: true
+      accept_unknown_host_keys: true
+    register: sp_switch_reset
+    loop: "{{ query('subelements', clusters, 'sp_nodes', {'skip_missing': True})}}"
+    loop_control:
+      label: '{{ item.0.clustername }}:{{ item.1.hostname }}:{{ item.1.sp_ip }}'
+    when: sp_finish_result[item.1.hostname] and sp_version_result[item.1.hostname]
+      and sp_verify_result[item.1.hostname]
+
+  - name: Populate SP/BMC switch-reset command results
+    tags:
+    - sp
+    set_fact:
+      sp_reset_result: '{{ sp_reset_result|default({}) | combine( {item.item.1.hostname:
+        item.changed} ) }}'
+    with_items:
+    - '{{ sp_switch_reset.results }}'
+    loop_control:
+      label: '{{ item.item.1.hostname }}'
+
+  - name: SP/BMC switch update commands- 'switch reset' command
+    tags:
+    - sp
+    na_ontap_ssh_command:
+      hostname: '{{ item.1.sp_ip }}'
+      <<: *login
+      command: '{{ item.1.sp_fw_type }} switch reset'
+      privilege: diag
+      sp: true
+      accept_unknown_host_keys: true
+    register: sp_switch_reset2
+    loop: "{{ query('subelements', clusters, 'sp_nodes', {'skip_missing': True})}}"
+    loop_control:
+      label: '{{ item.0.clustername }}:{{ item.1.hostname }}:{{ item.1.sp_ip }}'
+    when: sp_finish_result[item.1.hostname] and sp_version_result[item.1.hostname]
+      and sp_verify_result[item.1.hostname] and not sp_reset_result[item.1.hostname]
+
+  - name: Populate SP/BMC switch reset command results
+    tags:
+    - sp
+    set_fact:
+      sp_reset_result2: '{{ sp_reset_result2|default({}) | combine( {item.item.1.hostname:
+        item.changed} ) }}'
+    with_items:
+    - '{{ sp_switch_reset2.results }}'
+    loop_control:
+      label: '{{ item.item.1.hostname }}'
+
+  - name: Populating Hostnames with SP/BMC Firmware update failure
+    tags:
+    - sp
+    set_fact:
+      sp_failure: '{{ sp_failure|default([]) + [ result ] }}'
+    vars:
+      result: '{{ item.1.hostname }}'
+    loop: "{{ query('subelements', clusters, 'sp_nodes', {'skip_missing': True})}}"
+    loop_control:
+      label: '{{ item.0.clustername }}:{{ item.1.hostname }}:{{ item.1.sp_ip }}'
+    when: not sp_finish_result[item.1.hostname]
+
+  - name: Populating Hostnames with SP/BMC Firmware update success and SP/BMC Switch
+      update failure
+    tags:
+    - sp
+    set_fact:
+      switch_failure: '{{ switch_failure|default([]) + [ result ] }}'
+    vars:
+      result: '{{ item.1.hostname }}'
+    loop: "{{ query('subelements', clusters, 'sp_nodes', {'skip_missing': True})}}"
+    loop_control:
+      label: '{{ item.0.clustername }}:{{ item.1.hostname }}:{{ item.1.sp_ip }}'
+    when: sp_finish_result[item.1.hostname] and not (sp_reset_result[item.1.hostname]
+      or sp_reset_result2[item.1.hostname])
+
+  - name: Populating Hostnames which completed SP/BMC Firmware and switch update
+    tags:
+    - sp
+    set_fact:
+      complete_success: '{{ complete_success|default([]) + [ result ] }}'
+    vars:
+      result: '{{ item.1.hostname }}'
+    loop: "{{ query('subelements', clusters, 'sp_nodes', {'skip_missing': True})}}"
+    loop_control:
+      label: '{{ item.0.clustername }}:{{ item.1.hostname }}:{{ item.1.sp_ip }}'
+    when: sp_reset_result[item.1.hostname] or sp_reset_result2[item.1.hostname]
+
+  - name: Hostnames with successful SP/BMC Firmware and SP/BMC switch update
+    tags:
+    - sp
+    debug:
+      msg: '{{ complete_success|default([]) }}'
+
+  - name: Hostnames with successful SP/BMC firmware update and unsucessful SP/BMC
+      switch update
+    tags:
+    - sp
+    debug:
+      msg:
+      - Please try updating the SP/BMC switch firmware manually on these systems.
+      - '{{ switch_failure|default([]) }}'
+
+  - name: Hostnames with unsuccessful SP/BMC firmware update and SP/BMC switch update
+    tags:
+    - sp
+    debug:
+      msg:
+      - Please try updating the SP/BMC firmware manually on these systems.
+      - '{{ sp_failure|default([]) }}'
