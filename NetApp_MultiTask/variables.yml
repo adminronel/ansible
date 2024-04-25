@@ -53,7 +53,7 @@ vservername: SVM1
 # Variables for '05_create_volume.yml'
 aggr: netappuk_cluster_01_FC_1
 nfsvolname2: NFS_vol2
-vservername: SVM1
+vservername: svm01
 nfsvolsize2: 10 # Size is in GB
 
 # Variables: for '06_mount_nfs_datastore.yml'
