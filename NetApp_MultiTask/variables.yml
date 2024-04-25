@@ -51,7 +51,7 @@ lifnetmask: 255.255.255.0
 vservername: SVM1
 
 # Variables for '05_create_volume.yml'
-aggr: aggr1_CLUSTER96_01_data
+aggr: netappuk_cluster_01_FC_1
 nfsvolname2: NFS_vol2
 vservername: SVM1
 nfsvolsize2: 10 # Size is in GB
