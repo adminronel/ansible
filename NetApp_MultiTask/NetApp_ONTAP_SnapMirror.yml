@@ -1,3 +1,4 @@
+---
 # creates and initializes the snapmirror
 - name: Create ONTAP/ONTAP SnapMirror
   netapp.ontap.na_ontap_snapmirror:
