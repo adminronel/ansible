@@ -21,7 +21,7 @@ aggrdataname: aggr1_CLUSTER96_01_data
 diskcount: 26
 
 # Variables for '03_create_svm.yml'
-svmname: SVM1
+svmname: svm01
 rootvolname: SVM1_root
 rootvolaggr: aggr1_CLUSTER96_01_data
 rootvolsecurity: unix
